@@ -1,6 +1,7 @@
 def convert_msg_to_hex_array(raw_string):
-    hex_array = ["x00"]
-    return hex_array
+    hex_str = hex_str.replace(' ', '')
+    # Convert every two hex characters to an integer
+    return [int(hex_str[i:i+2], 16) for i in range(0, len(hex_str), 2)]
 
 def decode_pack_voltage(hex_array):
 
