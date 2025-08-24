@@ -5,6 +5,7 @@ import helper.charging_profile as charger
 import serial
 import sys
 import time
+import json
 
 
 def main():
@@ -52,12 +53,12 @@ def main():
             pack_soc = decoded_data["soc"]
             pack_voltage = decoded_data["pack_voltage"]
             pack_current = decoded_data["pack_current"]
-            print(pack_soc, pack_voltage, pack_current)
+            print(json.dumps(decoded_data, indent=2))
 
             if pack_soc > 0.95:
                 charging_control.stop_charging()
                 dq_charger.stop()
-                print("SOC greater than desired amount, stopping charging")
+                print(f"SOC greater than desired amount ({pack_soc}%), stopping charging")
                 sys.exit()
             else:
                 if not charging_control.charging:
