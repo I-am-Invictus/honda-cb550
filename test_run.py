@@ -8,41 +8,65 @@ import time
 
 
 def main():
-    ser = serial.Serial("/dev/serial0", 115200, timeout=1)
+    # RS-485 Serial connection to BMS
+    ser = serial.Serial(
+        port='/dev/ttyUSB0',
+        baudrate=19200,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=1  # seconds
+    )
+
+    # Charging controller and Delta-Q charger init
     charging_control = charger.charging_control()
-    dq_charger = deltaq.ChargerController(can_interface="can0",
-                                volts=0,
-                                amps=0,
-                                temperature=0,
-                                soc=0)
+    dq_charger = deltaq.ChargerController(
+        can_interface="can0",
+        volts=0,
+        amps=0,
+        temperature=0,
+        soc=0
+    )
+
+    # 6-byte BMS query command
+    bms_request = bytes.fromhex("5A5A00000000")
 
     while True:
-        line = None
-        if ser.in_waiting > 0:
-            # Read a line (up to newline '\n')
-            line = ser.readline().decode('utf-8').strip()
-        if line is None:
+        # Send query
+        ser.write(bms_request)
+        time.sleep(0.3)  # Give BMS time to respond
+
+        # Read response
+        response = ser.read(140)
+
+        if len(response) != 140:
+            print(f"Expected 140 bytes, got {len(response)}. Retrying...")
             continue
-
-        decoded_data = ttl.convert_full_msg(line)
-
-        pack_soc = decoded_data["soc"]
-        pack_voltage = decoded_data["pack_voltage"]
-        pack_current = decoded_data["pack_current"]
-
-        if pack_soc > .95:
-            charging_control.stop_charging() #don't do charging
-            dq_charger.stop()
-            print("SOC greater than desired amount, stopping charging")
-            sys.exit()
         else:
-            if not charging_control.charging:
-                charging_control.start_charging(pack_voltage, pack_current)
-                dq_charger.start()
+            response = list(response)
 
-        request_current, request_voltage = charging_control.run_update(pack_voltage, pack_current)
+        try:
+            # Decode data (assuming TTL decoding works with RS-485 frame)
+            decoded_data = ttl.convert_full_msg(response)
 
-        output = f"""
+            pack_soc = decoded_data["soc"]
+            pack_voltage = decoded_data["pack_voltage"]
+            pack_current = decoded_data["pack_current"]
+            print(pack_soc, pack_voltage, pack_current)
+
+            if pack_soc > 0.95:
+                charging_control.stop_charging()
+                dq_charger.stop()
+                print("SOC greater than desired amount, stopping charging")
+                sys.exit()
+            else:
+                if not charging_control.charging:
+                    charging_control.start_charging(pack_voltage, pack_current)
+                    dq_charger.start()
+
+            request_current, request_voltage = charging_control.run_update(pack_voltage, pack_current)
+
+            output = f"""
 ----------- {time.strftime('%Y-%m-%d %H:%M:%S')} -----------
 Pack Voltage:           {pack_voltage:.2f} V
 Pack Current:           {pack_current:.2f} A
@@ -51,11 +75,14 @@ Requested Charge Voltage: {request_voltage:.2f} V
 Requested Charge Current: {request_current:.2f} A
 ===============================================
 """
+            print(output)
 
-        print(output)
+            dq_charger.update(volts=request_voltage, amps=request_current, temperature=25.0, soc=pack_soc)
 
-        dq_charger.update(volts=request_voltage, amps=request_current, temperature=25.0, soc=pack_soc)
-        
+        except Exception as e:
+            print(f"Error decoding BMS data: {e}")
+            continue
+
 
 if __name__ == "__main__":
     main()

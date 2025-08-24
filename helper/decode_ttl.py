@@ -1,7 +1,5 @@
-def convert_msg_to_hex_array(raw_string):
-    hex_str = hex_str.replace(' ', '')
-    # Convert every two hex characters to an integer
-    return [int(hex_str[i:i+2], 16) for i in range(0, len(hex_str), 2)]
+def convert_msg_to_hex_array(byte_list):
+    return byte_list
 
 def decode_pack_voltage(hex_array):
 
@@ -42,8 +40,8 @@ def decode_soc(hex_array):
 # add in temps, etc
 
 
-def convert_full_msg(raw_string):
-    hex_array = convert_full_msg(raw_string)
+def convert_full_msg(byte_list):
+    hex_array = byte_list
     pack_voltage = decode_pack_voltage(hex_array)
     pack_current = decode_pack_current(hex_array)
     soc = decode_soc(hex_array)
