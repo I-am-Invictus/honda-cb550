@@ -1,0 +1,270 @@
+I am using a deltaq ICL1500-85 version. That is meant for 84 volts.
+
+I am using this to note behavior:
+
+Setup the CAN bus (need to do this automatically through systemd at some point)
+sudo ip link set can0 up type can bitrate 500000
+sudo ifconfig can0 txqueuelen 65536
+
+When you plug in the charger, it ends up in a "Pre-operational" State only broadcasting:
+
+Decoded [0x70a]: {'Heartbeat': 'Pre-operational'}
+
+To get it out of this pre-operational state, you need to send:
+
+BATTERY_NODE_ID  = 0x01
+CHARGER_NODE_ID  = 0x0A
+
+def nmt_start_charger(bus: can.BusABC):
+    data = bytes([0x01, CHARGER_NODE_ID])   # 0x01 = Start
+    msg  = can.Message(arbitration_id=NMT_ID, is_extended_id=False, data=data)
+    bus.send(msg)
+
+CAN ID: 0x000  
+DLC: 2  
+Data: 0x01 0x0A   # Start Node, Node ID 10
+
+The charger will start to broadcasting this:
+
+Decoded [0x70a]: {'Heartbeat': 'Operational'}
+Charger is now Operational
+Decoded [0x28a]: {'Elapsed_Time': 0, 'Ah_Returned': 0.0, 'Wh_Returned': 0.0}
+Decoded [0x38a]: {'Current_Error': 0, 'AC_Voltage': 122.0625, 'Charger_SOC': 255}
+Decoded [0x18a]: {'Charging_Current': 19.48828125, 'Battery_Voltage': 81.13671875, 'Charger_Hardware_Shutdown_Status': 'Charger is running normally', 'Charger_Derating_Status': 'Charger is not derating', 'AC_Connection_Status': 'AC Detected', 'Charger_Status': 'Enabled', 'Override_Status': 'Disabled', 'Charge_Indication': 'Inactive', 'Charge_Cycle_Type': 'No Active Cycle'}
+
+Indiciating that the charger is now operational. This makes sense to the spec.
+
+Import to note in that mode, it is currently in local mode it appears: 
+'Override_Status': 'Disabled', 'Charge_Indication': 'Inactive', 'Charge_Cycle_Type': 'No Active Cycle'
+
+Override status is off, but Charge_Indication is inactive still.
+
+--------- We need to do all of these things to start charging ------
+So according to the docs:
+
+During remote control mode the charger will not deliver charge without all of the following conditions being satisfied.
+ An active CAN Heartbeat connection present with the Battery Control Module. See section 4.5 Handshaking for details of the handshaking protocol.
+ A Battery Status Ready Indication from the Battery control module. See section 4.8.1 Battery Status Object – 6000h (rw).
+ A Valid Current Request has been received see section 4.8.6 Charger Current Request Object - 6070h (rw)
+Additionally voltage control of the charger is provided as specified in section 4.9.22 Voltage Limit Request. The initial value of the voltage limit in this mode is the Charger maximum voltage (Please see the specific Charger Product Specification for details of your charger). This is to allow customers who only want to control current to charge without problems.
+The charger shall stop charging if any of the above conditions goes false.
+
+
+---- CAN Heartbeat ----
+
+This is the heartbeat that the charger should be putting out, which it does:
+BO_ 1802 DeltaQ_Heartbeat_0x70a: 1 Charger
+ SG_ Heartbeat : 0|8@1+ (1,0) [0|255] ""  Battery
+
+see here: Decoded [0x70a]: {'Heartbeat': 'Operational'}
+
+I am not sure the Node ID of the BMS is 1, but based on the original CAN spec from the 48v version. 
+
+BO_ 1793 Heartbeat_Response: 1 Battery
+ SG_ Heartbeat_Response : 0|8@1+ (1,0) [0|255] ""  Charger
+
+Which translates to [0x701]
+
+So this should be right:
+    cob_id = HEARTBEAT_BASE + BATTERY_NODE_ID
+    state_byte = 0x05  # Operational
+
+HEARTBEAT_BASE       = 0x700
+BATTERY_NODE_ID  = 0x01
+CHARGER_NODE_ID  = 0x0A
+
+So if we add the battery heartbeat message into the mix. Lets see what happens...
+
+Sending heartbeat: 1793 - 5
+Decoded [0x8a]: {'Fault_Register': 0}
+Decoded [0x18a]: {'Charging_Current': 19.484375, 'Battery_Voltage': 81.0078125, 'Charger_Hardware_Shutdown_Status': 'Charger is running normally', 'Charger_Derating_Status': 'Charger is not derating', 'AC_Connection_Status': 'AC Detected', 'Charger_Status': 'Enabled', 'Override_Status': 'Enabled', 'Charge_Indication': 'Inactive', 'Charge_Cycle_Type': 'No Active Cycle'}
+
+'Override_Status': 'Enabled'
+
+Looks like sending the heartbeat message enabled the override status, which means it is in remote mode now.
+
+just to confirm if I turn it off:
+
+'Override_Status': 'Disabled' - Yup, so if you don't send the heartbeat, the orride status is disabled.
+
+I think this is met:
+ An active CAN Heartbeat connection present with the Battery Control Module. See section 4.5 Handshaking for details of the handshaking protocol.
+
+----- Part 2 -----
+ A Battery Status Ready Indication from the Battery control module. See section 4.8.1 Battery Status Object – 6000h (rw).
+
+Lets see what this is...
+
+I am assuming it is this RPDO:
+
+BO_ 522 DeltaQ_RPDO1_0x20a: 8 Battery
+ SG_ Battery_SOC : 8|8@1+ (1,0) [0|100] "%"  Charger
+ SG_ Batt_Charge_Cycle_Type : 16|8@1+ (1,0) [0|255] ""  Charger
+ SG_ Voltage_Request : 24|16@1+ (0.00390625,0) [0|255.99609375] "V"  Charger
+ SG_ Charge_Current_Request : 40|16@1+ (0.0625,0) [0|4095.9375] "A"  Charger
+ SG_ Battery_Status : 56|8@1+ (1,0) [0|255] ""  Charger
+
+Maybe not.. Lets see.
+
+According to the document, I need to do an SDO download to 6000h to the charger.
+
+In both modes it is only possible to set this parameter while the heartbeat is detected.
+
+So this looks right:
+Sending heartbeat: 1793 - 5
+→ Sent SDO download 0x6000/00 = 1
+Raw [0x58a]: 6000600000000000
+Decoded [0x70a]: {'Heartbeat': 'Operational'}
+Decoded [0x28a]: {'Elapsed_Time': 0, 'Ah_Returned': 0.0, 'Wh_Returned': 0.0}
+Decoded [0x38a]: {'Current_Error': 0, 'AC_Voltage': 121.8125, 'Charger_SOC': 255}
+Decoded [0x18a]: {'Charging_Current': 19.48828125, 'Battery_Voltage': 80.92578125, 'Charger_Hardware_Shutdown_Status': 'Charger is running normally', 'Charger_Derating_Status': 'Charger is not derating', 'AC_Connection_Status': 'AC Detected', 'Charger_Status': 'Enabled', 'Override_Status': 'Enabled', 'Charge_Indication': 'Inactive', 'Charge_Cycle_Type': 'No Active Cycle'}
+
+So I am fine?, nothing changed.
+
+----- Part 3 ---------
+
+A Valid Current Request has been received see section 4.8.6 Charger Current Request Object - 6070h (rw)
+Additionally voltage control of the charger is provided as specified in section 4.9.22 Voltage Limit Request. 
+The initial value of the voltage limit in this mode is the Charger maximum voltage (Please see the specific Charger Product Specification for details of your charger). 
+This is to allow customers who only want to control current to charge without problems.
+
+So that means I just need to set current request object and potentially set the voltage limit.
+
+vreq_raw = int(vreq / 0.00390625) & 0xFFFFFFFF  # 32-bit mask
+ireq_raw = int(ireq / 0.0625) & 0xFFFF
+sdo_download(bus, 0x2271, 0x00, vreq_raw, 4)
+time.sleep(1)
+sdo_download(bus, 0x6070, 0x00, ireq_raw, 2)
+time.sleep(1)
+
+These messages work by writing, but I have no idea on the scaling.
+
+Also the charge indication is still inactive:
+
+'Charge_Indication': 'Inactive'
+
+---------------------------------------
+
+It looks like it setup to handle the RPDOs.
+
+RPDO1 (mandatory)
+
+Contains:
+
+Battery temperature → Object 6010h (INTEGER16, multiples of 0.125 °C)
+
+Battery status → Object 6000h (UNSIGNED8, bit 0 = ready/not ready)
+
+📤 Meaning: You tell the charger the battery’s current temperature and whether it is ready to accept charge.
+
+RPDO2 (optional substitute for RPDO1)
+
+Contains:
+
+Battery voltage → Object 6060h (UNSIGNED32, in steps of 1/1024 V)
+
+Battery temperature → Object 6010h
+
+Battery status → Object 6000h
+
+📤 Meaning: Like RPDO1 but extended with actual battery voltage.
+
+RPDO3 (optional)
+
+Contains:
+
+Charge current requested → Object 6070h (UNSIGNED16, in steps of 1/16 A)
+
+Battery state of charge → Object 6081h (UNSIGNED8, % SOC)
+
+📤 Meaning: Lets the battery module directly request how much current it wants and provide its own SOC estimate.
+
+
+
+
+
+
+RPDO1:
+  Comm idx: 0x1400   Map idx: 0x1600
+  COB-ID:   0x0000020A   enabled=True   TT=0xFF
+  Map count: 6   Total bits: 64 (bytes: 8)
+  Entries:
+    • 0x2FFA:01  (unknown)  [8b]
+    • 0x6081:00  Battery_SOC  [UNSIGNED8, 8b]  → eng = raw %
+    • 0x4201:00  (unknown)  [8b]
+    • 0x2276:00  (unknown)  [16b] - Voltage Limit (Volts x 256)
+    • 0x6070:00  Battery_Current  [UNSIGNED16, 16b]  → eng = raw / 16 A
+    • 0x6000:00  Battery_Status  [UNSIGNED8, 8b]  → device-specific
+
+RPDO2:
+  Comm idx: 0x1401   Map idx: 0x1601
+  COB-ID:   0x0000030A   enabled=True   TT=0xFF
+  Map count: 5   Total bits: 64 (bytes: 8)
+  Entries:
+    • 0x2FFA:01  (unknown)  [8b]
+    • 0x2FFA:01  (unknown)  [8b]
+    • 0x2002:00  (unknown)  [16b] - Charging Current (Amps x 256)
+    • 0x2101:00  (unknown)  [16b] - Battery Voltage (Volts x 256)
+    • 0x6010:00  Batt_Temperature  [INTEGER16, 16b]  → eng = raw * 1 °C
+
+
+Those PDOs:
+
+RPDO1:
+  Comm idx: 0x1400   Map idx: 0x1600
+  COB-ID:   0x0000020A   enabled=True   TT=0xFF
+  Map count: 6   Total bits: 64 (bytes: 8)
+  Entries:
+    • 0x2FFA:01  (unknown)  [8b]
+    • 0x6081:00  Battery_SOC  [UNSIGNED8, 8b]  → eng = raw %
+    • 0x4201:00  (unknown)  [8b]
+    • 0x2276:00  (unknown)  [16b]
+    • 0x6070:00  Battery_Current  [UNSIGNED16, 16b]  → eng = raw / 16 A
+    • 0x6000:00  Battery_Status  [UNSIGNED8, 8b]  → device-specific
+
+RPDO2:
+  Comm idx: 0x1401   Map idx: 0x1601
+  COB-ID:   0x0000030A   enabled=True   TT=0xFF
+  Map count: 5   Total bits: 64 (bytes: 8)
+  Entries:
+    • 0x2FFA:01  (unknown)  [8b]
+    • 0x2FFA:01  (unknown)  [8b]
+    • 0x2002:00  (unknown)  [16b] - Charging Current (Amps x 256)
+    • 0x2101:00  (unknown)  [16b] - Battery Voltage (Volts x 256)
+    • 0x6010:00  Batt_Temperature  [INTEGER16, 16b]  → eng = raw * 1 °C
+
+
+    | Byte(s) | Object        | Meaning (likely)                                    | Encoding                               |
+| ------- | ------------- | --------------------------------------------------- | -------------------------------------- |
+| 0       | **0x2FFA:01** | unknown/reserved (often 0 or a counter)             | `u8`                                   |
+| 1       | **0x6081:00** | Battery\_SOC                                        | `u8` (0–100 %)                         |
+| 2       | **0x4201:00** | **Batt\_Charge\_Cycle\_Type** (your code sets this) | `u8` (enum)                            |
+| 3–4     | **0x2276:00** | **Voltage\_Request**                                | `u16` little-endian; **V = raw / 256** |
+| 5–6     | **0x6070:00** | **Battery\_Current (request)**                      | `u16` little-endian; **A = raw / 16**  |
+| 7       | **0x6000:00** | **Battery\_Status** (Enabled/Disabled, etc.)        | `u8` (bitfield/enum)                   |
+
+b0 = 0x2FFA:01 (unknown)
+b1 = SOC
+b2 = CycleType
+b3 = Voltage_Request_raw LSB
+b4 = Voltage_Request_raw MSB
+b5 = Battery_Current_raw LSB
+b6 = Battery_Current_raw MSB
+b7 = Battery_Status
+
+| Byte(s) | Object        | Meaning                    | Type     | Encoding (engineering ↔ raw)      |
+| ------- | ------------- | -------------------------- | -------- | --------------------------------- |
+| 0       | **0x2FFA:01** | unknown / reserved         | `u8`     | usually `0x00` (or a counter)     |
+| 1       | **0x2FFA:01** | unknown / reserved         | `u8`     | usually `0x00` (or a counter)     |
+| 2–3     | **0x2002:00** | Charging Current (request) | `u16` LE | **A ↔ raw = round(A × 256)**      |
+| 4–5     | **0x2101:00** | Battery Voltage (request)  | `u16` LE | **V ↔ raw = round(V × 256)**      |
+| 6–7     | **0x6010:00** | Battery Temperature        | `i16` LE | **Two possibilities (see below)** |
+
+b0 = 0x2FFA:01 (unknown)
+b1 = 0x2FFA:01 (unknown)
+b2 = current_raw LSB
+b3 = current_raw MSB
+b4 = voltage_raw LSB
+b5 = voltage_raw MSB
+b6 = temperature_raw LSB
+b7 = temperature_raw MSB

@@ -1,106 +1,166 @@
 import can
+import cantools
 import threading
 import time
 import signal
 import sys
+import argparse
 
 class ChargerController(threading.Thread):
-    def __init__(self, can_interface="can0", volts=0.0, amps=0.0, temperature=20.0, soc=50, send_interval=1.0):
+    def __init__(self, can_interface="can0", volts=0.0, amps=0.0, temperature=20.0, soc=50,
+                 send_interval=1.0, dbc_path="/home/nmc220/honda-cb550/org_delta_q.dbc", read_only=False, node_id=1):
         super().__init__()
-        self.daemon = True  # optional, thread exits when main program exits
+        self.daemon = True
         self.can_interface = can_interface
         self.volts = volts
         self.amps = amps
         self.temperature = temperature
         self.soc = soc
         self.send_interval = send_interval
-        
+        self.read_only = read_only
+        self.node_id = node_id
+
         self._running = threading.Event()
         self._running.set()
-        self._lock = threading.Lock()  # protect shared data
+        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
 
         self.bus = can.interface.Bus(channel=self.can_interface, bustype='socketcan')
 
-    def build_frame_20x30a(self, volts, amps, temperature):
-        data = bytearray(8)
-        voltage_raw = int(volts * 10)    # 0.1V/bit
-        current_raw = int(amps * 10)     # 0.1A/bit
-        temp_raw = int(temperature)      # 1°C/bit
-        data[0:2] = voltage_raw.to_bytes(2, 'little')
-        data[2:4] = current_raw.to_bytes(2, 'little')
-        data[4:6] = temp_raw.to_bytes(2, 'little')
-        data[6:] = b'\x00\x00'  # reserved
-        return can.Message(arbitration_id=0x20, data=data, is_extended_id=False)
+        # Load DBC
+        self.dbc = cantools.database.load_file(dbc_path)
+        self.current_state = {}
 
-    def build_frame_10x20a(self, volts, amps, soc):
-        data = bytearray(8)
-        voltage_raw = int(volts * 10)    # 0.1V/bit
-        current_raw = int(amps * 10)     # 0.1A/bit
-        data[0] = soc  # state of charge (0-100%)
-        data[1:3] = voltage_raw.to_bytes(2, 'little')
-        data[3:5] = current_raw.to_bytes(2, 'little')
-        data[5:] = b'\x00\x00\x00'  # status + reserved
-        return can.Message(arbitration_id=0x10, data=data, is_extended_id=False)
+        # Messages from DBC
+        self.rpdo1 = self.dbc.get_message_by_name("DeltaQ_RPDO1_0x20a")
 
-    def send_commands(self):
-        with self._lock:
-            volts = self.volts
-            amps = self.amps
-            temperature = self.temperature
-            soc = self.soc
+        # Track NMT state transition
+        self.nmt_started = False
 
-        msg1 = self.build_frame_20x30a(volts, amps, temperature)
-        msg2 = self.build_frame_10x20a(volts, amps, soc)
-        self.bus.send(msg1)
-        self.bus.send(msg2)
+    # --------------------------
+    # CAN frame builders
+    # --------------------------
+    def send_heartbeat(self):
+        msg = can.Message(arbitration_id=0x701,
+                          data=[0x05],
+                          is_extended_id=False)
+        self.bus.send(msg)
 
+    def send_battery_status(self, voltage, current, ready=True):
+        data = self.rpdo1.encode({
+            "Voltage_Request": voltage,
+            "Charge_Current_Request": current,
+            "Battery_Status": 1 if ready else 0,
+            "Battery_SOC": self.soc,
+            "Batt_Charge_Cycle_Type": 1
+        })
+        msg = can.Message(arbitration_id=self.rpdo1.frame_id,
+                          data=data,
+                          is_extended_id=False)
+        self.bus.send(msg)
+
+    def send_nmt_start(self):
+        msg = can.Message(arbitration_id=0x000,
+                          data=[0x01, self.node_id],
+                          is_extended_id=False)
+        self.bus.send(msg)
+        print(f"Sent NMT Start Remote Node to node {self.node_id}")
+
+    # --------------------------
+    # Thread loop
+    # --------------------------
     def run(self):
+        receiver_timeout = 0.1
+        last_send_time = time.time()
+
         while self._running.is_set():
+            current_time = time.time()
+
+            # Periodic sends only after Operational
+            if not self.read_only and self.nmt_started and (current_time - last_send_time >= self.send_interval):
+                try:
+                    with self._lock:
+                        volts = self.volts
+                        amps = self.amps
+                    self.send_heartbeat()
+                    self.send_battery_status(volts, amps, ready=True)
+                    print("Sent heartbeat and battery status")
+                except can.CanError as e:
+                    print(f"CAN send error: {e}")
+                last_send_time = current_time
+
+            # Receive
             try:
-                self.send_commands()
+                msg = self.bus.recv(timeout=receiver_timeout)
+                if msg:
+                    self.process_received_message(msg)
             except can.CanError as e:
-                print(f"CAN send error: {e}")
-            time.sleep(self.send_interval)
+                print(f"CAN receive error: {e}")
 
-    def stop(self):
-        self._running.clear()
-        # Send zero commands to safely stop charging
+    def process_received_message(self, msg):
         try:
-            self.volts = 0.0
-            self.amps = 0.0
-            self.send_commands()
-        except can.CanError:
-            pass
-        self.bus.shutdown()
+            decoded = self.dbc.decode_message(msg.arbitration_id, msg.data)
+            with self._state_lock:
+                self.current_state[msg.arbitration_id] = decoded
+            print(f"Decoded [{hex(msg.arbitration_id)}]: {decoded}")
 
-    def update(self, volts=None, amps=None, temperature=None, soc=None):
+            # Detect charger heartbeat state
+            if "Heartbeat" in decoded:
+                if decoded["Heartbeat"] == "Pre-operational" and not self.nmt_started and not self.read_only:
+                    print("Charger in Pre-operational → sending NMT Start")
+                    self.send_nmt_start()
+                    
+                elif decoded["Heartbeat"] == "Operational":
+                    self.nmt_started = True
+                    print("Charger is now Operational")
+
+        except (KeyError, ValueError):
+            print(f"Unhandled: {msg.arbitration_id} | {msg.data}")
+
+    def get_current_state(self):
+        with self._state_lock:
+            return self.current_state.copy()
+
+    def update(self, volts=None, amps=None, soc=None):
         with self._lock:
             if volts is not None:
                 self.volts = volts
             if amps is not None:
                 self.amps = amps
-            if temperature is not None:
-                self.temperature = temperature
             if soc is not None:
                 self.soc = soc
 
-# Example usage
-if __name__ == "__main__":
-    import argparse
+    def stop(self):
+        self._running.clear()
+        if not self.read_only and self.nmt_started:
+            try:
+                self.send_battery_status(0, 0, ready=False)
+            except can.CanError:
+                pass
+        self.bus.shutdown()
 
-    parser = argparse.ArgumentParser(description="Threaded DeltaQ CAN charger controller")
+
+# --------------------------
+# Main entry
+# --------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DeltaQ Charger Controller with DBC decoding")
     parser.add_argument("-v", "--volts", type=float, default=0.0)
     parser.add_argument("-a", "--amps", type=float, default=0.0)
-    parser.add_argument("-t", "--temperature", type=float, default=20.0)
     parser.add_argument("-s", "--soc", type=int, default=50)
     parser.add_argument("-c", "--can_interface", default="can0")
+    parser.add_argument("-d", "--dbc", required=True, help="Path to DBC file")
+    parser.add_argument("--read_only", action="store_true")
+    parser.add_argument("--node_id", type=int, default=1, help="CANopen node ID of charger")
     args = parser.parse_args()
 
     charger = ChargerController(can_interface=args.can_interface,
                                 volts=args.volts,
                                 amps=args.amps,
-                                temperature=args.temperature,
-                                soc=args.soc)
+                                soc=args.soc,
+                                dbc_path=args.dbc,
+                                read_only=args.read_only,
+                                node_id=args.node_id)
     charger.start()
 
     def handle_exit(sig, frame):
@@ -110,15 +170,15 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGINT, handle_exit)
 
-    print(f"Started charger thread with V={args.volts}A={args.amps}T={args.temperature}°C SOC={args.soc}%")
-    print("Press Ctrl+C to stop.")
+    if args.read_only:
+        print("Started in READ-ONLY mode. Listening only...")
+    else:
+        print(f"Started charger thread with V={args.volts} A={args.amps} SOC={args.soc}%")
+        print("Waiting for Pre-operational heartbeat to send NMT Start...")
 
-    # Example: dynamically update charging values every 10 seconds (demo)
     try:
         while True:
-            time.sleep(10)
-            # Example update, in real case update as needed
-            charger.update(volts=48.0, amps=15.0, temperature=25.0, soc=60)
-            print("Updated charger params.")
+            time.sleep(5)
+            print("Current decoded state:", charger.get_current_state())
     except KeyboardInterrupt:
         handle_exit(None, None)
