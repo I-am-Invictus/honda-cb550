@@ -167,8 +167,8 @@ def i16(v): return struct.pack("<h", v)  # add near your other pack helpers
 
 #------------- RPDO sender (matches updated DBC) ---------------------------
 def send_rpdos(bus: can.BusABC, stop_ev: threading.Event,
-               soc=76, vreq=82.0, ireq=10.0, temperature=30.0,
-               cycle_type=1, batt_status=1, charging_current=10.0, vbat=82.0):
+               soc=76, vreq=82.0, ireq=2.0, temperature=30.0,
+               cycle_type=0, batt_status=1, charging_current=10.0, vbat=82.0):
     """
     Periodically send:
       RPDO1 @ 0x20A:
@@ -200,12 +200,15 @@ def send_rpdos(bus: can.BusABC, stop_ev: threading.Event,
         # --- Inputs → raw encodings ---
         soc_u8         = clamp(int(round(soc)), 0, 100)             # %
         cycle_u8       = clamp(int(round(cycle_type)), 0, 255)
-        batt_status_u8 = clamp(int(round(batt_status)), 0, 255)
+        if counter == 0:
+            batt_status_u8 = clamp(int(round(0)), 0, 255)
+        else:
+            batt_status_u8 = clamp(int(round(1)), 0, 255)
 
         vreq_u16_256   = clamp(int(round(vreq * 256.0)), 0, 0xFFFF)   # V * 256
         ireq_u16_16    = clamp(int(round(ireq * 16.0)),  0, 0xFFFF)   # A * 16
 
-        charge_A_u16_256 = clamp(int(round(charging_current * 256.0)), 0, 0xFFFF)  # A * 256
+        charge_A_u16_256 = clamp(int(round(charging_current * 16.0)), 0, 0xFFFF)  # A * 16
         bat_volt_u16_256 = clamp(int(round(vbat * 256.0)), 0, 0xFFFF)              # V * 256
         temp_i16 = int(round((temperature + 40.0) / 0.125))  # scale + offset
 
@@ -237,17 +240,17 @@ def send_rpdos(bus: can.BusABC, stop_ev: threading.Event,
             msg1 = can.Message(arbitration_id=RPDO1_COBID, is_extended_id=False, data=rpdo1_data)
             msg2 = can.Message(arbitration_id=RPDO2_COBID, is_extended_id=False, data=rpdo2_data)
             bus.send(msg1)
-            bus.send(msg2)
+            # bus.send(msg2)
             print(
                 f"TX RPDO1 0x{RPDO1_COBID:03X} [{rpdo1_data.hex()}]  "
                 f"(SOC={soc_u8}%, Cycle={cycle_u8}, Vreq={vreq}V→0x{vreq_u16_256:04X}, "
                 f"Ireq={ireq}A→0x{ireq_u16_16:04X}, Status=0x{batt_status_u8:02X})"
             )
-            print(
-                f"TX RPDO2 0x{RPDO2_COBID:03X} [{rpdo2_data.hex()}]  "
-                f"(Ibat={charging_current}A→0x{charge_A_u16_256:04X}, "
-                f"Vbat={vbat}V→0x{bat_volt_u16_256:04X}, T={temp_i16/8}°C)"
-            )
+            # print(
+            #     f"TX RPDO2 0x{RPDO2_COBID:03X} [{rpdo2_data.hex()}]  "
+            #     f"(Ibat={charging_current}A→0x{charge_A_u16_256:04X}, "
+            #     f"Vbat={vbat}V→0x{bat_volt_u16_256:04X}, T={temp_i16/8}°C)"
+            # )
         except can.CanError:
             # Keep running even if a frame drops
             pass
