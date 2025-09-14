@@ -21,13 +21,6 @@ def main():
 
     # Charging controller and Delta-Q charger init
     charging_control = charger.charging_control()
-    # dq_charger = deltaq.ChargerController(
-    #     can_interface="can0",
-    #     volts=0,
-    #     amps=0,
-    #     temperature=0,
-    #     soc=0
-    # )
 
     # 6-byte BMS query command
     bms_request = bytes.fromhex("5A5A00000000")
@@ -53,16 +46,15 @@ def main():
             pack_soc = decoded_data["soc"]
             pack_voltage = decoded_data["pack_voltage"]
             pack_current = decoded_data["pack_current"]
-            print(json.dumps(decoded_data, indent=2))
 
-            if pack_soc > 0.95:
+            if pack_soc > 95:
                 charging_control.stop_charging()
                 #dq_charger.stop()
                 print(f"SOC greater than desired amount ({pack_soc}%), stopping charging")
                 sys.exit()
             else:
                 if not charging_control.charging:
-                    charging_control.start_charging(pack_voltage, pack_current)
+                    #charging_control.start_charging(pack_voltage, pack_current)
                     #dq_charger.start()
 
             request_current, request_voltage = charging_control.run_update(pack_voltage, pack_current)
@@ -77,8 +69,6 @@ Requested Charge Current: {request_current:.2f} A
 ===============================================
 """
             print(output)
-
-            #dq_charger.update(volts=request_voltage, amps=request_current, temperature=25.0, soc=pack_soc)
 
         except Exception as e:
             print(f"Error decoding BMS data: {e}")

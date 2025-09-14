@@ -6,9 +6,50 @@ import signal
 import sys
 import argparse
 
+# --- pack helpers using to_bytes ---
+def u8(v: int) -> bytes:
+    """Unsigned 8-bit, little-endian"""
+    return v.to_bytes(1, byteorder="little", signed=False)
+
+def u16(v: int) -> bytes:
+    """Unsigned 16-bit, little-endian"""
+    return v.to_bytes(2, byteorder="little", signed=False)
+
+def i16(v: int) -> bytes:
+    """Signed 16-bit, little-endian"""
+    return v.to_bytes(2, byteorder="little", signed=True)
+
+def u32(v: int) -> bytes:
+    """Unsigned 32-bit, little-endian"""
+    return v.to_bytes(4, byteorder="little", signed=False)
+
+# --- clamp helper ---
+def clamp(val: int | float, lo: int | float, hi: int | float):
+    """Clamp val into [lo, hi]"""
+    return max(lo, min(hi, val))
+
+BITRATE = 500000
+BUSTYPE = "socketcan"
+CHANNEL = "can0"
+
+BATTERY_NODE_ID  = 0x01
+CHARGER_NODE_ID  = 0x0A
+
+HEARTBEAT_PERIOD_S = 0.1
+# --------------------------------------------------
+
+# COB-IDs used by CANopen:
+NMT_ID               = 0x000
+HEARTBEAT_BASE       = 0x700
+SDO_CLIENT_TO_SERVER = 0x600
+SDO_SERVER_TO_CLIENT = 0x580
+
+RPDO1_COBID = 0x20A  # 522
+
+
 class ChargerController(threading.Thread):
     def __init__(self, can_interface="can0", volts=0.0, amps=0.0, temperature=20.0, soc=50,
-                 send_interval=1.0, dbc_path="/home/nmc220/honda-cb550/org_delta_q.dbc", read_only=False, node_id=1):
+                 send_interval=1.0, dbc_path="/home/nmc220/honda-cb550/docs/org_delta_q.dbc", read_only=False, node_id=1):
         super().__init__()
         self.daemon = True
         self.can_interface = can_interface
@@ -31,40 +72,61 @@ class ChargerController(threading.Thread):
         self.dbc = cantools.database.load_file(dbc_path)
         self.current_state = {}
 
-        # Messages from DBC
-        self.rpdo1 = self.dbc.get_message_by_name("DeltaQ_RPDO1_0x20a")
-
-        # Track NMT state transition
-        self.nmt_started = False
-
     # --------------------------
     # CAN frame builders
     # --------------------------
-    def send_heartbeat(self):
-        msg = can.Message(arbitration_id=0x701,
-                          data=[0x05],
-                          is_extended_id=False)
-        self.bus.send(msg)
 
-    def send_battery_status(self, voltage, current, ready=True):
-        data = self.rpdo1.encode({
-            "Voltage_Request": voltage,
-            "Charge_Current_Request": current,
-            "Battery_Status": 1 if ready else 0,
-            "Battery_SOC": self.soc,
-            "Batt_Charge_Cycle_Type": 1
-        })
-        msg = can.Message(arbitration_id=self.rpdo1.frame_id,
-                          data=data,
-                          is_extended_id=False)
-        self.bus.send(msg)
+    def start_heartbeat(self, period=0.05):
+        """
+        Start heartbeat producer with python-can's send_periodic.
+        Returns the task object so you can stop() later.
+        """
+        cob_id = HEARTBEAT_BASE + BATTERY_NODE_ID
+        state_byte = 0x05  # Operational
 
-    def send_nmt_start(self):
-        msg = can.Message(arbitration_id=0x000,
-                          data=[0x01, self.node_id],
-                          is_extended_id=False)
+        msg = can.Message(arbitration_id=cob_id,
+                        is_extended_id=False,
+                        data=[state_byte])
+
+        self.hb_task = self.bus.send_periodic(msg, period)
+        print(f"Started heartbeat @ {period*1000:.0f}ms, COB-ID=0x{cob_id:03X}")
+    
+    def stop_heartbeat(self):
+        self.hb_task.stop()
+        print("Stopping heartbeat message")
+
+    def send_0x20a(self, soc=76, vreq=82.0, ireq=2.0, temperature=30.0,
+               cycle_type=0):
+        soc_u8         = clamp(int(round(soc)), 0, 100)             # %
+        cycle_u8       = clamp(int(round(cycle_type)), 0, 255)
+        if self.counter == 0:
+            batt_status_u8 = clamp(int(round(0)), 0, 255)
+        else:
+            batt_status_u8 = clamp(int(round(1)), 0, 255)
+
+        vreq_u16_256   = clamp(int(round(vreq * 256.0)), 0, 0xFFFF)   # V * 256
+        ireq_u16_16    = clamp(int(round(ireq * 16.0)),  0, 0xFFFF)   # A * 16
+
+        # --- RPDO1 payload (0x20A) ---
+        # Byte0: reserved/counter (DBC doesn’t map it)
+        b0 = 0x00
+        b1 = soc_u8
+        b2 = cycle_u8
+        vreq_bytes = u16(vreq_u16_256)
+        ireq_bytes = u16(ireq_u16_16)
+        b7 = batt_status_u8
+
+        rpdo1_data = bytes([b0, b1, b2]) + vreq_bytes + ireq_bytes + bytes([b7])
+
+        msg1 = can.Message(arbitration_id=RPDO1_COBID, is_extended_id=False, data=rpdo1_data)
+        self.bus.send(msg1)
+
+        self.counter = self.counter + 1
+
+    def nmt_start_charger(self):
+        data = bytes([0x01, CHARGER_NODE_ID])   # 0x01 = Start
+        msg  = can.Message(arbitration_id=NMT_ID, is_extended_id=False, data=data)
         self.bus.send(msg)
-        print(f"Sent NMT Start Remote Node to node {self.node_id}")
 
     # --------------------------
     # Thread loop
@@ -137,6 +199,7 @@ class ChargerController(threading.Thread):
                 self.send_battery_status(0, 0, ready=False)
             except can.CanError:
                 pass
+        self.stop_heartbeat()
         self.bus.shutdown()
 
 

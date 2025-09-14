@@ -16,7 +16,7 @@ import time
 import struct
 
 # Load your DeltaQ dbc file (adjust path)
-dbc = cantools.database.load_file("/home/nmc220/honda-cb550/delta_q.dbc")
+dbc = cantools.database.load_file("/home/nmc220/honda-cb550/docs/delta_q.dbc")
 
 # --------------------- CONFIG ---------------------
 BITRATE = 500000
@@ -36,16 +36,11 @@ SDO_CLIENT_TO_SERVER = 0x600
 SDO_SERVER_TO_CLIENT = 0x580
 
 def u8(v):  return struct.pack("<B", v)
-def u16(v): return struct.pack("<H", v)
 def u32(v): return struct.pack("<I", v)
-def i16(v): return struct.pack("<h", v)  # add near your other pack helpers
-
 # --- clamp helpers ---
 def clamp(val, lo, hi): return max(lo, min(hi, val))
-
 def u16(val):  # little-endian unsigned
     return val.to_bytes(2, byteorder="little", signed=False)
-
 def i16(val):  # little-endian signed
     return val.to_bytes(2, byteorder="little", signed=True)
 
@@ -167,7 +162,7 @@ def i16(v): return struct.pack("<h", v)  # add near your other pack helpers
 
 #------------- RPDO sender (matches updated DBC) ---------------------------
 def send_rpdos(bus: can.BusABC, stop_ev: threading.Event,
-               soc=76, vreq=82.0, ireq=2.0, temperature=30.0,
+               soc=76, vreq=82.0, ireq=5.0, temperature=30.0,
                cycle_type=0, batt_status=1, charging_current=10.0, vbat=82.0):
     """
     Periodically send:
@@ -190,7 +185,7 @@ def send_rpdos(bus: can.BusABC, stop_ev: threading.Event,
     RPDO2_COBID = 0x30A  # 778
 
     # 10 Hz to match 0x180x/0x1A0x period 100ms in your OD above
-    period = .25
+    period = .15
     next_time = time.monotonic()
 
     # Simple rolling counter for the 0x2FFA:01 bytes (optional; set to 0x00 if undesired)
