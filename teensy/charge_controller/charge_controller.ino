@@ -2,6 +2,14 @@
 #include <FlexCAN_T4.h>
 #include "DbcTypes.h"
 #include "DbcDecode.h"
+#include "BmsDecoder.h"
+
+// Use Serial1 for TTL RX/TX (pins 0=RX1, 1=TX1 on Teensy 4.1)
+#define BMS_SERIAL Serial1
+
+// BMS request bytes
+const uint8_t BMS_REQUEST[6] = {0x5A, 0x5A, 0x00, 0x00, 0x00, 0x00};
+
 
 // Teensy 4.1 CAN1: CRX1=22, CTX1=23
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
@@ -134,6 +142,8 @@ bool firstRPDO1 = true;
 // -------------------- Arduino Setup/Loop --------------------
 void setup() {
   Serial.begin(115200);
+
+  BMS_SERIAL.begin(115200);
   while (!Serial && millis() < 3000) {}
   Serial.println("Teensy 4.1 CAN1 Battery Simulator");
 
@@ -142,7 +152,8 @@ void setup() {
   can1.onReceive(onRx);
   can1.enableMBInterrupts();
 
-  delay(500);         // let bus settle
+  delay(5000);         // let bus settle
+  // TODO add a step to wait until 0x701 heartbeat is seen on the bus before beginning
   sendNMTStart();     // Step 1: send NMT start
   hbTimer = 0;
   rpdoTimer = 0;
@@ -166,13 +177,20 @@ void loop() {
 
   // Example: print state once per second
   static uint32_t t_last = 0;
-  if (millis() - t_last > 1000) {
+  if (millis() - t_last > 2000) {
     t_last = millis();
-    if (sysState.tpdo3_38a.valid) {
-      auto &d = sysState.tpdo3_38a.data;
-      Serial.printf("[STATE] Charger SOC=%u%%, AC=%.1f VAC, Err=%s\n",
-                    d.charger_soc_pct, d.ac_voltage_VAC,
-                    d.current_error_text.c_str());
+    if (sysState.tpdo1_18a.valid) {
+      auto &d = sysState.tpdo1_18a.data;
+      Serial.printf("[0x18A] I=%.2f A, V=%.2f V, HW=%s, Derating=%s, AC=%s, Charger=%s, Override=%s, Indication=%s, Cycle=%s\n",
+                    d.charging_current_A,
+                    d.battery_voltage_V,
+                    dbc::toString(d.hw_shutdown).c_str(),
+                    dbc::toString(d.derating).c_str(),
+                    dbc::toString(d.ac_status).c_str(),
+                    dbc::toString(d.charger_status).c_str(),
+                    dbc::toString(d.override_status).c_str(),
+                    dbc::toString(d.charge_indication).c_str(),
+                    dbc::toString(d.charge_cycle_type).c_str());
     }
   }
 }
